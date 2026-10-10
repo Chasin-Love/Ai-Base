@@ -20,4 +20,6 @@ public:
 
 	UPROPERTY(EditAnywhere, Category = "Portal Targeting")
 	float TraceDistance = 10000.f;
+	UPROPERTY(EditAnywhere, Category = "Portal")
+	TSubclassOf<AActor> PortalClass;
 };

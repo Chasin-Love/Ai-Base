@@ -4,6 +4,7 @@
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
+#include "Kismet/GameplayStatics.h"
 
 APortalTargeter::APortalTargeter()
 {
@@ -52,7 +53,14 @@ void APortalTargeter::Tick(float DeltaTime)
 		// LEFT CLICK = RED flash test (future portal spawn!)
 		if (PC->WasInputKeyJustPressed(EKeys::LeftMouseButton))
 		{
-			DrawDebugSphere(World, Hit.Location, 40.f, 16, FColor::Red, false, 2.f, 3.f);
+			if (PortalClass)
+			{
+				FTransform SpawnTransform;
+				SpawnTransform.SetLocation(Hit.Location);
+				SpawnTransform.SetRotation(FQuat::Identity); // We will fix the wall rotation next!
+
+				GetWorld()->SpawnActor<AActor>(PortalClass, SpawnTransform);
+			}
 		}
 	}
 }
