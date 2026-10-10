@@ -94,6 +94,12 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Portal Targeting")
 	bool bContinuousDebugPreview = false;
 
+	/** Stage 2 test overlay: armed/tunnel status lines, portal labels + rings and pairing
+	 *  messages. Keep OFF for clean gameplay (only a failed shot or [Z] shows a message);
+	 *  turn ON to see full portal diagnostics while testing. */
+	UPROPERTY(EditAnywhere, Category = "Portal Targeting")
+	bool bShowTestOverlay = false;
+
 	/** Portal blueprint/actor class to spawn (defaults to BP_Portal) */
 	UPROPERTY(EditAnywhere, Category = "Portal")
 	TSubclassOf<AActor> PortalClass;

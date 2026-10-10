@@ -64,6 +64,16 @@ void APortalTargeter::BeginPlay()
 	{
 		PortalClass = StaticLoadClass(AActor::StaticClass(), nullptr, TEXT("/Game/Characters/BP_Portal.BP_Portal_C"));
 	}
+
+	// Loud warning if the portal visual class is missing - otherwise portals would place silently
+	if (!PortalClass && GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			-1,
+			10.f,
+			FColor::Red,
+			TEXT("PortalTargeter: BP_Portal class not found - portals cannot spawn. Check /Game/Characters/BP_Portal."));
+	}
 }
 
 void APortalTargeter::Tick(float DeltaTime)
@@ -121,9 +131,14 @@ void APortalTargeter::Tick(float DeltaTime)
 		DrawPlacementPreview(World, CamLoc, CamForward, PreviewPlacement);
 	}
 
-	// 3. Render HUD and in-world feedback
-	RenderHUD();
-	RenderActivePortalsInWorld(World);
+	// 3. Stage 2 test overlay (off for clean gameplay; enable on the actor for diagnostics)
+	if (bShowTestOverlay)
+	{
+		RenderHUD();
+		RenderActivePortalsInWorld(World);
+	}
+
+	// 4. An illegal shot always shows a short reason at the impact point
 	RenderFailFeedback(World);
 }
 
@@ -392,6 +407,11 @@ void APortalTargeter::ApplyPortalVisuals(AActor* PortalActor, int32 TunnelId, EP
 
 void APortalTargeter::UpdateTunnelLinking(int32 TunnelIndex)
 {
+	if (!bShowTestOverlay)
+	{
+		return;
+	}
+
 	const FPortalTunnel& Tunnel = Tunnels[TunnelIndex];
 	const FString TunnelStr = FString::Printf(TEXT("Tunnel %d"), Tunnel.TunnelId);
 
