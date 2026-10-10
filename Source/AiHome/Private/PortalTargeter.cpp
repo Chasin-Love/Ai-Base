@@ -1099,6 +1099,17 @@ void APortalTargeter::SetPortalViewTexture(AActor* PortalActor, UTextureRenderTa
 		return;
 	}
 
+	// Stage 7 material half: swap onto the dedicated portal-window material (created via
+	// Source/AiHome/Tools/CreatePortalViewMaterial.py). One MID per portal so each binds
+	// its own capture render target. Falls back to the original material if the asset
+	// is missing.
+	UMaterialInterface* PortalViewMatBase = LoadObject<UMaterialInterface>(
+		nullptr, TEXT("/Game/Characters/M_PortalView.M_PortalView"));
+	if (!PortalViewMatBase)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Portal view material not found (/Game/Characters/M_PortalView) - using PortalView param on original material"));
+	}
+
 	TArray<UMeshComponent*> MeshComponents;
 	PortalActor->GetComponents<UMeshComponent>(MeshComponents);
 	for (UMeshComponent* Mesh : MeshComponents)
@@ -1111,6 +1122,17 @@ void APortalTargeter::SetPortalViewTexture(AActor* PortalActor, UTextureRenderTa
 		const int32 NumMats = Mesh->GetNumMaterials();
 		for (int32 MatIdx = 0; MatIdx < NumMats; ++MatIdx)
 		{
+			if (PortalViewMatBase)
+			{
+				UMaterialInstanceDynamic* ViewMat = UMaterialInstanceDynamic::Create(PortalViewMatBase, Mesh);
+				if (ViewMat)
+				{
+					ViewMat->SetTextureParameterValue(FName("PortalView"), RenderTarget);
+					Mesh->SetMaterial(MatIdx, ViewMat);
+					continue;
+				}
+			}
+
 			UMaterialInterface* CurrentMat = Mesh->GetMaterial(MatIdx);
 			if (!CurrentMat)
 			{
