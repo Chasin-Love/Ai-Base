@@ -1,0 +1,9 @@
+﻿Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
