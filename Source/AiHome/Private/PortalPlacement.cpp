@@ -6,50 +6,86 @@
 namespace
 {
 	constexpr float MovingBodySpeedSq = 25.f; // ~5 cm/s
-
-	bool IsMovingBodyActor(const AActor* Actor)
-	{
-		if (!Actor)
-		{
-			return false;
-		}
-		if (Actor->IsA<APawn>())
-		{
-			return true;
-		}
-		if (Actor->GetVelocity().SizeSquared() > MovingBodySpeedSq)
-		{
-			return true;
-		}
-		return false;
-	}
+	constexpr float MovingBodySpinSq = 900.f;  // ~30 deg/s (physics bodies)
 }
 
 bool FPortalPlacement::IsMovingSurface(const FHitResult& Hit)
 {
 	const UPrimitiveComponent* Primitive = Hit.GetComponent();
+	const AActor* HitActor = Hit.GetActor();
+
+	auto ReportMoving = [HitActor, Primitive](const TCHAR* Reason, float SpeedSq)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("Portal MOVING: %s | actor=%s component=%s mobility=%d simPhysics=%d speedSq=%.1f"),
+			Reason,
+			*GetNameSafe(HitActor),
+			*GetNameSafe(Primitive),
+			Primitive ? static_cast<int32>(Primitive->Mobility.GetValue()) : -1,
+			(Primitive && Primitive->IsSimulatingPhysics()) ? 1 : 0,
+			SpeedSq);
+	};
+
+	// People are never valid portal surfaces, even when standing still.
+	if (HitActor && HitActor->IsA<APawn>())
+	{
+		ReportMoving(TEXT("hit actor is a pawn"), 0.f);
+		return true;
+	}
+
 	if (Primitive)
 	{
-		// Static mobility can never be moving
+		if (const AActor* RootActor = Primitive->GetAttachmentRootActor())
+		{
+			if (RootActor->IsA<APawn>())
+			{
+				ReportMoving(TEXT("attached to a pawn"), 0.f);
+				return true;
+			}
+			if (RootActor->GetVelocity().SizeSquared() > MovingBodySpeedSq)
+			{
+				ReportMoving(TEXT("attachment root moving"), RootActor->GetVelocity().SizeSquared());
+				return true;
+			}
+		}
+
+		// Static world geometry can never move.
 		if (Primitive->Mobility == EComponentMobility::Static)
 		{
 			return false;
 		}
+
+		// Physics bodies count as moving only while they are actually in motion.
 		if (Primitive->IsSimulatingPhysics())
 		{
-			return true;
+			const float LinearSpeedSq = Primitive->GetComponentVelocity().SizeSquared();
+			const float AngularSpeedSq = Primitive->GetPhysicsAngularVelocityInDegrees().SizeSquared();
+			if (LinearSpeedSq > MovingBodySpeedSq || AngularSpeedSq > MovingBodySpinSq)
+			{
+				ReportMoving(TEXT("physics body in motion"), FMath::Max(LinearSpeedSq, AngularSpeedSq));
+				return true;
+			}
 		}
-		if (Primitive->GetComponentVelocity().SizeSquared() > MovingBodySpeedSq)
+
+		const float ComponentSpeedSq = Primitive->GetComponentVelocity().SizeSquared();
+		if (ComponentSpeedSq > MovingBodySpeedSq)
 		{
-			return true;
-		}
-		if (IsMovingBodyActor(Primitive->GetAttachmentRootActor()))
-		{
+			ReportMoving(TEXT("component velocity"), ComponentSpeedSq);
 			return true;
 		}
 	}
 
-	return IsMovingBodyActor(Hit.GetActor());
+	if (HitActor)
+	{
+		const float ActorSpeedSq = HitActor->GetVelocity().SizeSquared();
+		if (ActorSpeedSq > MovingBodySpeedSq)
+		{
+			ReportMoving(TEXT("actor velocity"), ActorSpeedSq);
+			return true;
+		}
+	}
+
+	return false;
 }
 
 void FPortalPlacement::BuildPortalAxes(const FVector& Normal, FVector& OutRight, FVector& OutUp)

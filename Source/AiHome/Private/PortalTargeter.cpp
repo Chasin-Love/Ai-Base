@@ -1,13 +1,24 @@
 #include "PortalTargeter.h"
+#include "AiHomePortalHUD.h"
+#include "Components/SceneCaptureComponent2D.h"
+#include "Engine/TextureRenderTarget2D.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "Engine/Engine.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Components/CapsuleComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/MeshComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "CollisionShape.h"
+#include "Engine/OverlapResult.h"
+#include "Engine/StaticMeshActor.h"
+#include "Engine/StaticMesh.h"
+#include "Components/StaticMeshComponent.h"
 #include "InputCoreTypes.h"
 
 bool FPortalTunnel::IsLinked() const
@@ -108,7 +119,39 @@ void APortalTargeter::Tick(float DeltaTime)
 		HandleFire(World, PC, CamLoc, CamForward);
 	}
 
-	// 2. Optional continuous preview (Stage 1 style, off by default)
+	if (bDebugSpawnBallOnB && PC->WasInputKeyJustPressed(EKeys::B))
+	{
+		HandleDebugSpawnBall(World, CamLoc, CamForward);
+	}
+
+	// 2. Stage 3+4: the player, props and other characters travel through linked portals
+	UpdatePortalTeleport(World, PC);
+
+	// 2b. Stage 5: install the crosshair HUD once, and pulse portal glow by linking state
+	if (bCrosshairEnabled && !bHudInitialized)
+	{
+		AHUD* CurrentHUD = PC->GetHUD();
+		if (!CurrentHUD || !CurrentHUD->IsA<AAiHomePortalHUD>())
+		{
+			PC->ClientSetHUD(AAiHomePortalHUD::StaticClass());
+		}
+		bHudInitialized = true;
+	}
+
+	// Stage 7: ensure render target array and capture array stay sized with active portals
+	if (PortalRenderTargets.Num() != 2)
+	{
+		PortalRenderTargets.SetNum(2);
+	}
+	if (PortalCaptureComponents.Num() != 2)
+	{
+		PortalCaptureComponents.SetNum(2);
+	}
+
+	UpdatePortalVisuals(World, DeltaTime);
+	UpdatePortalCaptures(World);
+
+	// 3. Optional continuous preview (Stage 1 style, off by default)
 	if (bContinuousDebugPreview)
 	{
 		const FVector TraceEnd = CamLoc + CamForward * TraceDistance;
@@ -131,14 +174,14 @@ void APortalTargeter::Tick(float DeltaTime)
 		DrawPlacementPreview(World, CamLoc, CamForward, PreviewPlacement);
 	}
 
-	// 3. Stage 2 test overlay (off for clean gameplay; enable on the actor for diagnostics)
+	// 4. Stage 2 test overlay (off for clean gameplay; enable on the actor for diagnostics)
 	if (bShowTestOverlay)
 	{
 		RenderHUD();
 		RenderActivePortalsInWorld(World);
 	}
 
-	// 4. An illegal shot always shows a short reason at the impact point
+	// 5. An illegal shot always shows a short reason at the impact point
 	RenderFailFeedback(World);
 }
 
@@ -173,6 +216,545 @@ FCollisionQueryParams APortalTargeter::MakePlacementQueryParams(const APawn* MyP
 	}
 
 	return Params;
+}
+
+void APortalTargeter::UpdatePortalTeleport(UWorld* World, APlayerController* PC)
+{
+	if (!bTeleportEnabled || !World || !PC)
+	{
+		return;
+	}
+
+	APawn* PlayerPawn = PC->GetPawn();
+
+	// The player goes first: needs the controller view and rotation
+	if (PlayerPawn && World->GetTimeSeconds() >= TeleportCooldownUntil)
+	{
+		for (int32 TunnelIndex = 0; TunnelIndex < Tunnels.Num(); ++TunnelIndex)
+		{
+			const FPortalTunnel& Tunnel = Tunnels[TunnelIndex];
+			if (!Tunnel.IsLinked())
+			{
+				continue;
+			}
+
+			if (TryTeleportThroughPortal(Tunnel.SlotA, Tunnel.SlotB, Tunnel.TunnelId, PC, PlayerPawn) ||
+				TryTeleportThroughPortal(Tunnel.SlotB, Tunnel.SlotA, Tunnel.TunnelId, PC, PlayerPawn))
+			{
+				break;
+			}
+		}
+	}
+
+	// Then physics props and other characters
+	if (!bObjectsTeleportEnabled)
+	{
+		return;
+	}
+
+	for (int32 TunnelIndex = 0; TunnelIndex < Tunnels.Num(); ++TunnelIndex)
+	{
+		const FPortalTunnel& Tunnel = Tunnels[TunnelIndex];
+		if (!Tunnel.IsLinked())
+		{
+			continue;
+		}
+
+		TryTeleportObjectsThroughPortal(World, Tunnel.SlotA, Tunnel.SlotB, Tunnel.TunnelId, PlayerPawn);
+		TryTeleportObjectsThroughPortal(World, Tunnel.SlotB, Tunnel.SlotA, Tunnel.TunnelId, PlayerPawn);
+	}
+}
+
+bool APortalTargeter::TryTeleportThroughPortal(
+	const FPortalSlot& Entry,
+	const FPortalSlot& Exit,
+	int32 TunnelId,
+	APlayerController* PC,
+	APawn* Pawn)
+{
+	if (!Entry.bIsActive || !Exit.bIsActive ||
+		!IsValid(Entry.SpawnedActor) || !IsValid(Exit.SpawnedActor))
+	{
+		return false;
+	}
+
+	const FVector PawnLocation = Pawn->GetActorLocation();
+	const FVector PawnVelocity = Pawn->GetVelocity();
+
+	// How far the pawn's center is from the portal plane (positive = in front of the portal)
+	const FVector ToPawn = PawnLocation - Entry.Location;
+	const float DistanceToPlane = FVector::DotProduct(ToPawn, Entry.Normal);
+
+	// Capsule-aware: the surface of the player's capsule must reach (or pass) the portal plane.
+	// This makes both wall portals (side of the capsule) and floor portals (bottom of the capsule) work.
+	float CapsuleExtent = 0.f;
+	if (const ACharacter* Character = Cast<ACharacter>(Pawn))
+	{
+		if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
+		{
+			const float AxisAlign = FMath::Abs(FVector::DotProduct(Capsule->GetUpVector(), Entry.Normal));
+			CapsuleExtent = Capsule->GetScaledCapsuleRadius() * FMath::Sqrt(FMath::Max(0.f, 1.f - AxisAlign * AxisAlign))
+				+ Capsule->GetScaledCapsuleHalfHeight() * AxisAlign;
+		}
+	}
+
+	const float SurfaceGap = DistanceToPlane - CapsuleExtent;
+	if (SurfaceGap > TeleportTriggerDistance)
+	{
+		return false;
+	}
+
+	// The pawn's center must be inside the portal oval
+	const float LocalRight = FVector::DotProduct(ToPawn, Entry.Right);
+	const float LocalUp = FVector::DotProduct(ToPawn, Entry.Up);
+	constexpr float FitMargin = 0.9f;
+	if (FMath::Abs(LocalRight) > PortalHalfWidth * FitMargin ||
+		FMath::Abs(LocalUp) > PortalHalfHeight * FitMargin)
+	{
+		return false;
+	}
+
+	// The pawn must actually be heading into the portal: walking input or falling velocity
+	const float VelocityIntoPortal = -FVector::DotProduct(PawnVelocity, Entry.Normal);
+	const float InputIntoPortal = -FVector::DotProduct(Pawn->GetLastMovementInputVector(), Entry.Normal);
+	if (VelocityIntoPortal < 40.f && InputIntoPortal < 0.35f)
+	{
+		return false;
+	}
+
+	// Map the entry portal's frame onto the exit portal's frame.
+	// The 180-degree turn about the portal's local up axis is what sends motion INTO the entry
+	// out of the exit (velocity, view and strafing stay consistent with a real portal pair).
+	const FQuat EntryQuat = FRotationMatrix::MakeFromXZ(Entry.Normal, Entry.Up).ToQuat();
+	const FQuat ExitQuat = FRotationMatrix::MakeFromXZ(Exit.Normal, Exit.Up).ToQuat();
+	const FQuat PortalDelta = ExitQuat * FQuat(FVector::UpVector, PI) * EntryQuat.Inverse();
+
+	const FVector TangentialOffset = Entry.Right * LocalRight + Entry.Up * LocalUp;
+	FVector ExitLocation = Exit.Location
+		+ PortalDelta.RotateVector(TangentialOffset)
+		+ Exit.Normal * TeleportExitClearance;
+
+	// Never drop the player inside geometry: nudge further out of the exit when the spot is blocked
+	ExitLocation = FindSafeExitLocation(GetWorld(), ExitLocation, Exit.Normal, 42.f);
+
+	const FVector ExitVelocity = PortalDelta.RotateVector(PawnVelocity);
+
+	FVector ViewLocation;
+	FRotator ViewRotation;
+	PC->GetPlayerViewPoint(ViewLocation, ViewRotation);
+	const FVector ExitViewDirection = PortalDelta.RotateVector(ViewRotation.Vector());
+	const FRotator ExitControlRotation = ExitViewDirection.Rotation();
+
+	// Move the player through
+	const FRotator ExitActorRotation(0.f, ExitControlRotation.Yaw, 0.f);
+	Pawn->TeleportTo(ExitLocation, ExitActorRotation, false, true);
+
+	if (ACharacter* Character = Cast<ACharacter>(Pawn))
+	{
+		if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement())
+		{
+			Movement->Velocity = ExitVelocity;
+		}
+	}
+
+	if (USceneComponent* Root = Pawn->GetRootComponent())
+	{
+		Root->ComponentVelocity = ExitVelocity;
+	}
+
+	PC->SetControlRotation(ExitControlRotation);
+
+	if (UWorld* World = GetWorld())
+	{
+		TeleportCooldownUntil = World->GetTimeSeconds() + TeleportCooldown;
+	}
+
+	// Stage 5: a short screen flash sells the transit
+	if (bTeleportFeedbackEnabled && PC->PlayerCameraManager)
+	{
+		PC->PlayerCameraManager->StartCameraFade(0.65f, 0.f, 0.3f, FLinearColor(0.25f, 0.8f, 1.f, 1.f), false, false);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("Portal teleport: tunnel %d, pawn %s"), TunnelId, *GetNameSafe(Pawn));
+
+	if (bShowTestOverlay && GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			94,
+			2.0f,
+			FColor::Green,
+			FString::Printf(TEXT("[Tunnel %d] Teleported"), TunnelId));
+	}
+
+	return true;
+}
+
+FVector APortalTargeter::FindSafeExitLocation(UWorld* World, const FVector& DesiredLocation, const FVector& ExitNormal, float ProbeRadius) const
+{
+	if (!World)
+	{
+		return DesiredLocation;
+	}
+
+	auto IsBlocked = [World, ProbeRadius](const FVector& Location)
+	{
+		return World->OverlapBlockingTestByChannel(
+			Location,
+			FQuat::Identity,
+			ECC_Pawn,
+			FCollisionShape::MakeSphere(ProbeRadius));
+	};
+
+	if (!IsBlocked(DesiredLocation))
+	{
+		return DesiredLocation;
+	}
+
+	// Push a little further out of the exit portal until the player fits
+	for (float Push = 40.f; Push <= 200.f; Push += 40.f)
+	{
+		const FVector Candidate = DesiredLocation + ExitNormal * Push;
+		if (!IsBlocked(Candidate))
+		{
+			return Candidate;
+		}
+	}
+
+	return DesiredLocation;
+}
+
+void APortalTargeter::UpdatePortalVisuals(UWorld* World, float DeltaTime)
+{
+	PortalVisualTime += DeltaTime;
+	PortalShimmerTime += DeltaTime;
+
+	for (const FPortalTunnel& Tunnel : Tunnels)
+	{
+		const bool bLinked = Tunnel.IsLinked();
+		const float Pulse = FMath::Sin(PortalVisualTime * (bLinked ? 2.5f : 6.0f));
+
+		const FPortalSlot* Slots[2] = { &Tunnel.SlotA, &Tunnel.SlotB };
+
+		// Give the two portals in a pair a slightly different shimmer so they don't look identical
+		float SlotShimmerPhase[2] = { 0.f, 0.f };
+		SlotShimmerPhase[0] = PortalShimmerTime * ShimmerSpeed;
+		SlotShimmerPhase[1] = PortalShimmerTime * ShimmerSpeed + ShimmerPhaseOffset;
+
+		for (int32 SlotIndex = 0; SlotIndex < 2; ++SlotIndex)
+		{
+			const FPortalSlot* Slot = Slots[SlotIndex];
+			if (!Slot->bIsActive || !IsValid(Slot->SpawnedActor))
+			{
+				continue;
+			}
+
+			// Light glow
+			UPointLightComponent* Glow = Slot->SpawnedActor->FindComponentByClass<UPointLightComponent>();
+			if (Glow)
+			{
+				const float BaseIntensity = bLinked ? 2600.f : 1600.f;
+				Glow->SetIntensity(BaseIntensity + Pulse * (bLinked ? 350.f : 900.f));
+			}
+
+			// Material-driven ring + shimmer + glow
+			SetPortalMaterialParams(
+				Slot->SpawnedActor,
+				GetPortalColor(Tunnel.TunnelId, SlotIndex == 0 ? EPortalType::PortalA : EPortalType::PortalB),
+				SlotShimmerPhase[SlotIndex],
+				bLinked,
+				Pulse);
+		}
+	}
+}
+
+void APortalTargeter::SetPortalMaterialParams(
+	AActor* PortalActor,
+	const FColor& Color,
+	float ShimmerPhase,
+	bool bIsLinked,
+	float PortalPulse)
+{
+	if (!IsValid(PortalActor))
+	{
+		return;
+	}
+
+	const FLinearColor LinearColor(Color);
+	const float BaseEmissiveIntensity = bIsLinked ? GlowEmissiveIntensity : (GlowEmissiveIntensity * 0.6f);
+
+	TArray<UMeshComponent*> MeshComponents;
+	PortalActor->GetComponents<UMeshComponent>(MeshComponents);
+	for (UMeshComponent* Mesh : MeshComponents)
+	{
+		if (!Mesh)
+		{
+			continue;
+		}
+
+		const int32 NumMats = Mesh->GetNumMaterials();
+		for (int32 MatIdx = 0; MatIdx < NumMats; ++MatIdx)
+		{
+			UMaterialInterface* CurrentMat = Mesh->GetMaterial(MatIdx);
+			if (!CurrentMat)
+			{
+				continue;
+			}
+
+			UMaterialInstanceDynamic* DynMat = Cast<UMaterialInstanceDynamic>(CurrentMat);
+			if (!DynMat)
+			{
+				DynMat = UMaterialInstanceDynamic::Create(CurrentMat, Mesh);
+				Mesh->SetMaterial(MatIdx, DynMat);
+			}
+			if (!DynMat)
+			{
+				continue;
+			}
+
+			DynMat->SetVectorParameterValue(FName("Color"), LinearColor);
+			DynMat->SetVectorParameterValue(FName("BaseColor"), LinearColor);
+			DynMat->SetVectorParameterValue(FName("EmissiveColor"), LinearColor * BaseEmissiveIntensity);
+			DynMat->SetVectorParameterValue(FName("PortalColor"), LinearColor);
+
+			// Stage 6: ring + shimmer + glow (graceful no-ops if the material doesn't have these params)
+			DynMat->SetScalarParameterValue(FName("RenderRing"), bRenderRing ? 1.f : 0.f);
+			DynMat->SetScalarParameterValue(FName("RingThickness"), RingThickness);
+			DynMat->SetScalarParameterValue(FName("ShimmerSpeed"), ShimmerSpeed);
+			DynMat->SetScalarParameterValue(FName("ShimmerPhase"), ShimmerPhase);
+			DynMat->SetScalarParameterValue(FName("PortalPulse"), PortalPulse);
+		}
+	}
+}
+
+void APortalTargeter::TryTeleportObjectsThroughPortal(
+	UWorld* World,
+	const FPortalSlot& Entry,
+	const FPortalSlot& Exit,
+	int32 TunnelId,
+	const APawn* PlayerPawn)
+{
+	if (!Entry.bIsActive || !Exit.bIsActive || !IsValid(Entry.SpawnedActor) || !IsValid(Exit.SpawnedActor))
+	{
+		return;
+	}
+
+	// Find loose things hanging around the portal mouth: physics props and other characters
+	const float QueryRadius = FMath::Max(PortalHalfWidth, PortalHalfHeight) * 1.5f + 100.f;
+	const FVector QueryCenter = Entry.Location + Entry.Normal * 50.f;
+
+	TArray<FOverlapResult> Overlaps;
+	FCollisionObjectQueryParams ObjectQueryParams;
+	ObjectQueryParams.AddObjectTypesToQuery(ECC_PhysicsBody);
+	ObjectQueryParams.AddObjectTypesToQuery(ECC_WorldDynamic);
+	ObjectQueryParams.AddObjectTypesToQuery(ECC_Pawn);
+
+	if (!World->OverlapMultiByObjectType(
+		Overlaps,
+		QueryCenter,
+		FQuat::Identity,
+		ObjectQueryParams,
+		FCollisionShape::MakeSphere(QueryRadius)))
+	{
+		return;
+	}
+
+	TSet<AActor*> HandledActors;
+	for (const FOverlapResult& Overlap : Overlaps)
+	{
+		UPrimitiveComponent* Primitive = Overlap.GetComponent();
+		AActor* Actor = Overlap.GetActor();
+		if (!Primitive || !Actor || Actor == this || Actor == PlayerPawn)
+		{
+			continue;
+		}
+		if (Actor == Entry.SpawnedActor || Actor == Exit.SpawnedActor)
+		{
+			continue;
+		}
+		if (HandledActors.Contains(Actor))
+		{
+			continue;
+		}
+		HandledActors.Add(Actor);
+
+		// Only physics bodies and pawns can travel through; world geometry cannot
+		if (!Primitive->IsSimulatingPhysics() && !Actor->IsA<APawn>())
+		{
+			continue;
+		}
+
+		if (const double* CooldownEnd = ObjectTeleportCooldowns.Find(Actor))
+		{
+			if (*CooldownEnd > World->GetTimeSeconds())
+			{
+				continue;
+			}
+		}
+
+		TryTeleportObjectThroughPortal(World, Entry, Exit, TunnelId, Primitive);
+	}
+}
+
+bool APortalTargeter::TryTeleportObjectThroughPortal(
+	UWorld* World,
+	const FPortalSlot& Entry,
+	const FPortalSlot& Exit,
+	int32 TunnelId,
+	UPrimitiveComponent* Primitive)
+{
+	AActor* Actor = Primitive ? Primitive->GetOwner() : nullptr;
+	if (!World || !Actor)
+	{
+		return false;
+	}
+
+	const FVector ObjectLocation = Primitive->GetComponentLocation();
+	const FVector ObjectVelocity = Primitive->GetComponentVelocity();
+
+	const FVector ToObject = ObjectLocation - Entry.Location;
+	const float DistanceToPlane = FVector::DotProduct(ToObject, Entry.Normal);
+
+	// How far the object reaches toward the portal along the normal (box support distance)
+	const FBox ObjectBox = Actor->GetComponentsBoundingBox(true);
+	const FVector BoxExtent = ObjectBox.GetExtent();
+	const float ObjectExtent = FMath::Abs(BoxExtent.X * Entry.Normal.X)
+		+ FMath::Abs(BoxExtent.Y * Entry.Normal.Y)
+		+ FMath::Abs(BoxExtent.Z * Entry.Normal.Z);
+
+	// The object's surface must reach the portal plane...
+	const float SurfaceGap = DistanceToPlane - ObjectExtent;
+	if (SurfaceGap > TeleportTriggerDistance || DistanceToPlane < -(ObjectExtent + 25.f))
+	{
+		return false;
+	}
+
+	// ...its center must be inside the oval...
+	const float LocalRight = FVector::DotProduct(ToObject, Entry.Right);
+	const float LocalUp = FVector::DotProduct(ToObject, Entry.Up);
+	constexpr float FitMargin = 0.9f;
+	if (FMath::Abs(LocalRight) > PortalHalfWidth * FitMargin ||
+		FMath::Abs(LocalUp) > PortalHalfHeight * FitMargin)
+	{
+		return false;
+	}
+
+	// ...and it must actually be moving into the portal
+	const float VelocityIntoPortal = -FVector::DotProduct(ObjectVelocity, Entry.Normal);
+	if (VelocityIntoPortal < 30.f)
+	{
+		return false;
+	}
+
+	const FQuat EntryQuat = FRotationMatrix::MakeFromXZ(Entry.Normal, Entry.Up).ToQuat();
+	const FQuat ExitQuat = FRotationMatrix::MakeFromXZ(Exit.Normal, Exit.Up).ToQuat();
+	const FQuat PortalDelta = ExitQuat * FQuat(FVector::UpVector, PI) * EntryQuat.Inverse();
+
+	const FVector TangentialOffset = Entry.Right * LocalRight + Entry.Up * LocalUp;
+	const FVector ExitLocation = Exit.Location
+		+ PortalDelta.RotateVector(TangentialOffset)
+		+ Exit.Normal * (TeleportExitClearance + ObjectExtent);
+
+	const FVector ExitVelocity = PortalDelta.RotateVector(ObjectVelocity);
+	const FQuat ExitRotation = PortalDelta * Primitive->GetComponentQuat();
+
+	if (Primitive == Actor->GetRootComponent())
+	{
+		Actor->SetActorLocationAndRotation(ExitLocation, ExitRotation, false, nullptr, ETeleportType::TeleportPhysics);
+	}
+	else
+	{
+		Primitive->SetWorldLocationAndRotation(ExitLocation, ExitRotation, false, nullptr, ETeleportType::TeleportPhysics);
+	}
+
+	if (Primitive->IsSimulatingPhysics())
+	{
+		Primitive->SetPhysicsLinearVelocity(ExitVelocity);
+		Primitive->SetPhysicsAngularVelocityInDegrees(
+			PortalDelta.RotateVector(Primitive->GetPhysicsAngularVelocityInDegrees()));
+	}
+	else if (ACharacter* Character = Cast<ACharacter>(Actor))
+	{
+		if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement())
+		{
+			Movement->Velocity = ExitVelocity;
+		}
+	}
+
+	if (USceneComponent* Root = Actor->GetRootComponent())
+	{
+		Root->ComponentVelocity = ExitVelocity;
+	}
+
+	// Stage 6: re-dress the object's ring + shimmer + glow so it keeps the portal look after teleporting
+	SetPortalMaterialParams(
+		Actor,
+		GetPortalColor(TunnelId, EPortalType::PortalB),
+		PortalShimmerTime * ShimmerSpeed,
+		true,
+		0.f);
+
+	// Cooldown so the same object can't ping-pong instantly, plus housekeeping on dead entries
+	ObjectTeleportCooldowns.Add(Actor, World->GetTimeSeconds() + ObjectTeleportCooldown);
+	if (ObjectTeleportCooldowns.Num() > 64)
+	{
+		for (auto It = ObjectTeleportCooldowns.CreateIterator(); It; ++It)
+		{
+			if (!It.Key().IsValid())
+			{
+				It.RemoveCurrent();
+			}
+		}
+	}
+
+	if (bShowTestOverlay && GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			95,
+			2.0f,
+			FColor::Green,
+			FString::Printf(TEXT("[Tunnel %d] %s went through"), TunnelId, *GetNameSafe(Actor)));
+	}
+
+	return true;
+}
+
+void APortalTargeter::HandleDebugSpawnBall(UWorld* World, const FVector& CameraLocation, const FVector& CameraForward)
+{
+	if (!World)
+	{
+		return;
+	}
+
+	const FVector SpawnLocation = CameraLocation + CameraForward * 150.f;
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	SpawnParams.Owner = this;
+
+	AStaticMeshActor* Ball = World->SpawnActor<AStaticMeshActor>(
+		AStaticMeshActor::StaticClass(), SpawnLocation, FRotator::ZeroRotator, SpawnParams);
+	if (!Ball)
+	{
+		return;
+	}
+
+	if (UStaticMeshComponent* Mesh = Ball->GetStaticMeshComponent())
+	{
+		UStaticMesh* BallMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Sphere.Sphere"));
+		if (!BallMesh)
+		{
+			BallMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		}
+		if (BallMesh)
+		{
+			Mesh->SetStaticMesh(BallMesh);
+		}
+
+		Mesh->SetMobility(EComponentMobility::Movable);
+		Ball->SetActorScale3D(FVector(0.5f));
+		Mesh->SetCollisionProfileName(TEXT("PhysicsActor"));
+		Mesh->SetSimulatePhysics(true);
+		Mesh->SetPhysicsLinearVelocity(CameraForward * 900.f);
+	}
 }
 
 void APortalTargeter::HandleToggleArmedType()
@@ -241,8 +823,8 @@ void APortalTargeter::HandleFire(
 	PlacePortalInSlot(TargetTunnel, ArmedType, Placement);
 
 	// Beam effect in portal color
-	const FColor PortalColor = GetPortalColor(Tunnels[TargetTunnel].TunnelId, ArmedType);
-	DrawDebugLine(World, CameraLocation + CameraForward * 30.f, Placement.Location, PortalColor, false, 0.35f, 0, 3.0f);
+	const FColor BeamColor = GetPortalColor(Tunnels[TargetTunnel].TunnelId, ArmedType);
+	DrawDebugLine(World, CameraLocation + CameraForward * 30.f, Placement.Location, BeamColor, false, 0.35f, 0, 3.0f);
 
 	// Auto-flip ArmedType to opposite for natural A -> B loop
 	ArmedType = (ArmedType == EPortalType::PortalA) ? EPortalType::PortalB : EPortalType::PortalA;
@@ -352,40 +934,23 @@ void APortalTargeter::ApplyPortalVisuals(AActor* PortalActor, int32 TunnelId, EP
 	}
 
 	const FColor Color = GetPortalColor(TunnelId, Type);
-	const FLinearColor LinearColor(Color);
 
-	// Colorize all mesh components
-	TArray<UMeshComponent*> MeshComponents;
-	PortalActor->GetComponents<UMeshComponent>(MeshComponents);
-	for (UMeshComponent* Mesh : MeshComponents)
+	// Drive ring + shimmer + glow (gracefully no-ops if BP_Portal's material lacks these params)
+	SetPortalMaterialParams(PortalActor, Color, PortalShimmerTime * ShimmerSpeed, true, 0.f);
+
+	// Portals are holes, not obstacles: they must never block the player
+	TArray<UPrimitiveComponent*> PrimitiveComponents;
+	PortalActor->GetComponents<UPrimitiveComponent>(PrimitiveComponents);
+	for (UPrimitiveComponent* Primitive : PrimitiveComponents)
 	{
-		if (Mesh)
+		if (Primitive)
 		{
-			const int32 NumMats = Mesh->GetNumMaterials();
-			for (int32 MatIdx = 0; MatIdx < NumMats; ++MatIdx)
-			{
-				UMaterialInterface* CurrentMat = Mesh->GetMaterial(MatIdx);
-				if (CurrentMat)
-				{
-					UMaterialInstanceDynamic* DynMat = Cast<UMaterialInstanceDynamic>(CurrentMat);
-					if (!DynMat)
-					{
-						DynMat = UMaterialInstanceDynamic::Create(CurrentMat, Mesh);
-						Mesh->SetMaterial(MatIdx, DynMat);
-					}
-					if (DynMat)
-					{
-						DynMat->SetVectorParameterValue(FName("Color"), LinearColor);
-						DynMat->SetVectorParameterValue(FName("BaseColor"), LinearColor);
-						DynMat->SetVectorParameterValue(FName("EmissiveColor"), LinearColor * 3.f);
-						DynMat->SetVectorParameterValue(FName("PortalColor"), LinearColor);
-					}
-				}
-			}
+			Primitive->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		}
 	}
 
 	// Add/configure colored glow light
+	const FLinearColor LightColor = Color;
 	UPointLightComponent* LightComp = PortalActor->FindComponentByClass<UPointLightComponent>();
 	if (!LightComp)
 	{
@@ -399,45 +964,82 @@ void APortalTargeter::ApplyPortalVisuals(AActor* PortalActor, int32 TunnelId, EP
 	}
 	if (LightComp)
 	{
-		LightComp->SetLightColor(LinearColor);
+		LightComp->SetLightColor(LightColor);
 		LightComp->SetIntensity(3000.f);
 		LightComp->SetAttenuationRadius(350.f);
 	}
+
+	// Stage 7: live view through the portal
+	ConfigurePortalCapture(PortalActor, Slot, TunnelId, Type);
 }
 
-void APortalTargeter::UpdateTunnelLinking(int32 TunnelIndex)
+void APortalTargeter::SetPortalViewTexture(AActor* PortalActor, UTextureRenderTarget2D* RenderTarget)
 {
-	if (!bShowTestOverlay)
+	if (!IsValid(PortalActor) || !RenderTarget)
 	{
 		return;
 	}
 
-	const FPortalTunnel& Tunnel = Tunnels[TunnelIndex];
-	const FString TunnelStr = FString::Printf(TEXT("Tunnel %d"), Tunnel.TunnelId);
+	TArray<UMeshComponent*> MeshComponents;
+	PortalActor->GetComponents<UMeshComponent>(MeshComponents);
+	for (UMeshComponent* Mesh : MeshComponents)
+	{
+		if (!Mesh)
+		{
+			continue;
+		}
 
-	if (Tunnel.IsLinked())
-	{
-		if (GEngine)
+		const int32 NumMats = Mesh->GetNumMaterials();
+		for (int32 MatIdx = 0; MatIdx < NumMats; ++MatIdx)
 		{
-			GEngine->AddOnScreenDebugMessage(
-				90 + TunnelIndex,
-				3.0f,
-				FColor::Green,
-				FString::Printf(TEXT("[%s LINKED!] Portal A <=====> Portal B"), *TunnelStr));
+			UMaterialInterface* CurrentMat = Mesh->GetMaterial(MatIdx);
+			if (!CurrentMat)
+			{
+				continue;
+			}
+
+			UMaterialInstanceDynamic* DynMat = Cast<UMaterialInstanceDynamic>(CurrentMat);
+			if (!DynMat)
+			{
+				DynMat = UMaterialInstanceDynamic::Create(CurrentMat, Mesh);
+				Mesh->SetMaterial(MatIdx, DynMat);
+			}
+			if (DynMat)
+			{
+				dynMat = DynMat;
+				DynMat->SetTextureParameterValue(FName("PortalView"), RenderTarget);
+			}
 		}
 	}
-	else
+}
+
+bool APortalTargeter::IsPortalSurfaceVisibleInAnotherCapture(UWorld* World, const FPortalSlot& Slot) const
+{
+	if (!World || !Slot.bIsActive || !IsValid(Slot.SpawnedActor))
 	{
-		const FString PlacedType = (Tunnel.SlotA.bIsActive) ? TEXT("Portal A") : TEXT("Portal B");
-		if (GEngine)
+		return false;
+	}
+
+	// Recursion guard: if this same portal surface is visible through another live portal,
+	// don't render its own capture this frame (avoids the infinite-funnel artifact).
+	auto SamePortalSurface = [this, &Slot](const FPortalSlot& Other) -> bool
+	{
+		return Other.bIsActive
+		 && IsValid(Other.SpawnedActor)
+		 && Other.SpawnedActor != Slot.SpawnedActor
+		 && FMath::Abs(FVector::DotProduct(Slot.Normal, Other.Normal)) > 0.99f
+		 && FVector::Dist(Slot.Location, Other.Location) < 6.f;
+	};
+
+	for (const FPortalTunnel& Tunnel : Tunnels)
+	{
+		if (SamePortalSurface(Tunnel.SlotA) || SamePortalSurface(Tunnel.SlotB))
 		{
-			GEngine->AddOnScreenDebugMessage(
-				90 + TunnelIndex,
-				3.0f,
-				FColor::Yellow,
-				FString::Printf(TEXT("[%s] Placed %s. Waiting for Partner..."), *TunnelStr, *PlacedType));
+			return true;
 		}
 	}
+
+	return false;
 }
 
 FColor APortalTargeter::GetPortalColor(int32 TunnelId, EPortalType Type)
@@ -452,6 +1054,98 @@ FColor APortalTargeter::GetPortalColor(int32 TunnelId, EPortalType Type)
 		// Tunnel 2 (Backup): Neon Violet (A) & Golden Yellow (B)
 		return (Type == EPortalType::PortalA) ? FColor(190, 0, 255) : FColor(255, 208, 0);
 	}
+}
+
+void APortalTargeter::ConfigurePortalCapture(
+	AActor* PortalActor,
+	const FPortalSlot& Slot,
+	int32 TunnelId,
+	EPortalType Type)
+{
+	if (!IsValid(PortalActor) || !GetWorld())
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+
+	// Find or create the render target + scene capture for this portal surface
+	USceneCaptureComponent2D* Capture = Slot.CaptureComponent;
+	UTextureRenderTarget2D* RenderTarget = Slot.RenderTarget;
+
+	if (!IsValid(RenderTarget))
+	{
+		RenderTarget = NewObject<UTextureRenderTarget2D>(this);
+		if (RenderTarget)
+		{
+			RenderTarget->InitAutoFormat(PortalRenderTargetSize, PortalRenderTargetSize);
+			RenderTarget->UpdateResourceImmediate(true);
+		}
+	}
+
+	if (!IsValid(Capture))
+	{
+		Capture = NewObject<USceneCaptureComponent2D>(PortalActor);
+		if (Capture)
+		{
+			Capture->RegisterComponent();
+			Capture->SetupAttachment(PortalActor->GetRootComponent(), NAME_None);
+			Capture->SetMobility(EComponentMobility::Movable);
+			Capture->bCaptureEveryFrame = bPortalCaptureEveryFrame;
+			Capture->CaptureSource = ESceneCaptureSource::SCS_SceneColorHDR;
+			Capture->bEnableClipPlane = true;
+			Capture->ProjectionType = ECameraProjectionMode::Perspective;
+			Capture->bRenderInMainRenderer = false;
+		}
+	}
+
+	if (!IsValid(Capture) || !IsValid(RenderTarget))
+	{
+		return;
+	}
+
+	Capture->TextureTarget = RenderTarget;
+	Capture->CompositeMode = ESceneCaptureCompositeMode::SCM_None;
+	Capture->SetActorRelativeLocation(FVector::ZeroVector);
+	Capture->SetActorRelativeRotation(FRotator::ZeroRotator);
+
+	// Remember the live objects so UpdatePortalCaptures can drive them
+	Slot.CaptureComponent = Capture;
+	Slot.RenderTarget = RenderTarget;
+
+	// Stash into the global arrays so the render target survives and we can clear stale ones
+	// Remember the live objects so UpdatePortalCaptures can drive them
+	Slot.CaptureComponent = Capture;
+	Slot.RenderTarget = RenderTarget;
+
+	int32 SlotIndex = 0;
+	if (TunnelId == 1)
+	{
+		SlotIndex = 0;
+	}
+	else
+	{
+		SlotIndex = 1;
+	}
+	PortalRenderTargets[SlotIndex] = RenderTarget;
+	PortalCaptureComponents[SlotIndex] = Capture;
+
+	// Stash into the global arrays so the render target survives and we can clear stale ones
+	Slot.CaptureComponent = Capture;
+	Slot.RenderTarget = RenderTarget;
+
+	int32 SlotIndex = (TunnelId == 1) ? 0 : 1;
+	PortalRenderTargets[SlotIndex] = RenderTarget;
+	PortalCaptureComponents[SlotIndex] = Capture;
+
+	// Bind the render target to the portal mesh material (new PortalView param - graceful no-op if absent)
+	SetPortalMaterialParams(
+		PortalActor,
+		GetPortalColor(TunnelId, Type),
+		0.f,
+		true,
+		0.f);
+	SetPortalViewTexture(PortalActor, RenderTarget);
 }
 
 void APortalTargeter::RenderHUD()
