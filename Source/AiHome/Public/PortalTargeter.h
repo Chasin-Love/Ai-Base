@@ -190,13 +190,14 @@ private:
 	void HandleDebugSpawnBall(UWorld* World, const FVector& CameraLocation, const FVector& CameraForward);
 	FVector FindSafeExitLocation(UWorld* World, const FVector& DesiredLocation, const FVector& ExitNormal, float ProbeRadius) const;
 	void UpdatePortalVisuals(UWorld* World, float DeltaTime);
-	void UpdatePortalCaptures(UWorld* World);
 
 	// Stage 6: drive ring + shimmer + glow on a portal actor
 	void SetPortalMaterialParams(AActor* PortalActor, const FColor& Color, float ShimmerPhase, bool bIsLinked, float PortalPulse);
 
 	// Stage 7: live view through the portal
-	void ConfigurePortalCapture(AActor* PortalActor, const FPortalSlot& Slot, int32 TunnelId, EPortalType Type);
+	void ConfigurePortalCapture(AActor* PortalActor, FPortalSlot& Slot, int32 TunnelId, EPortalType Type);
+	void UpdatePortalCaptures(UWorld* World);
+	bool IsPortalSurfaceVisibleInAnotherCapture(UWorld* World, const FPortalSlot& Slot) const;
 	void SetPortalViewTexture(AActor* PortalActor, UTextureRenderTarget2D* RenderTarget);
 
 	int32 ResolveTargetTunnel(EPortalType TypeToPlace);
@@ -240,15 +241,10 @@ private:
 	bool bPortalCaptureEveryFrame = false;
 
 	// Stage 7: one render target + one capture per active portal surface
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Portal Visual")
+	UPROPERTY(VisibleAnywhere, Category = "Portal Visual")
 	TArray<TObjectPtr<UTextureRenderTarget2D>> PortalRenderTargets;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Portal Visual")
+	UPROPERTY(VisibleAnywhere, Category = "Portal Visual")
 	TArray<TObjectPtr<USceneCaptureComponent2D>> PortalCaptureComponents;
-
-	// Stage 7 helpers
-	void UpdatePortalCaptures(UWorld* World);
-	bool IsPortalSurfaceVisibleInAnotherCapture(UWorld* World, const FPortalSlot& Slot) const;
-	void SetPortalViewTexture(AActor* PortalActor, UTextureRenderTarget2D* RenderTarget);
 };
 

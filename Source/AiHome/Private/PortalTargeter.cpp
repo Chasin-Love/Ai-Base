@@ -57,6 +57,14 @@ APortalTargeter::APortalTargeter()
 	Tunnels.SetNum(2);
 	Tunnels[0].TunnelId = 1;
 	Tunnels[1].TunnelId = 2;
+
+	// Stage 7: keep the render target / capture slots allocated before any portal is placed
+	PortalRenderTargets.SetNum(2);
+	PortalCaptureComponents.SetNum(2);
+	PortalRenderTargets[0] = nullptr;
+	PortalRenderTargets[1] = nullptr;
+	PortalCaptureComponents[0] = nullptr;
+	PortalCaptureComponents[1] = nullptr;
 }
 
 void APortalTargeter::BeginPlay()
@@ -138,17 +146,11 @@ void APortalTargeter::Tick(float DeltaTime)
 		bHudInitialized = true;
 	}
 
-	// Stage 7: ensure render target array and capture array stay sized with active portals
-	if (PortalRenderTargets.Num() != 2)
-	{
-		PortalRenderTargets.SetNum(2);
-	}
-	if (PortalCaptureComponents.Num() != 2)
-	{
-		PortalCaptureComponents.SetNum(2);
-	}
+	// Stage 7: ensure render target array and capture array stay sized with active portals	
 
 	UpdatePortalVisuals(World, DeltaTime);
+
+	// Stage 7: update (or hide) each portal's live view after the visuals pulse this frame
 	UpdatePortalCaptures(World);
 
 	// 3. Optional continuous preview (Stage 1 style, off by default)
@@ -921,6 +923,7 @@ void APortalTargeter::PlacePortalInSlot(
 	if (IsValid(Slot.SpawnedActor))
 	{
 		ApplyPortalVisuals(Slot.SpawnedActor, Tunnels[TunnelIndex].TunnelId, Type);
+		ConfigurePortalCapture(Slot.SpawnedActor, Slot, Tunnels[TunnelIndex].TunnelId, Type);
 	}
 
 	UpdateTunnelLinking(TunnelIndex);
@@ -968,9 +971,125 @@ void APortalTargeter::ApplyPortalVisuals(AActor* PortalActor, int32 TunnelId, EP
 		LightComp->SetIntensity(3000.f);
 		LightComp->SetAttenuationRadius(350.f);
 	}
+}
 
-	// Stage 7: live view through the portal
-	ConfigurePortalCapture(PortalActor, Slot, TunnelId, Type);
+void APortalTargeter::UpdateTunnelLinking(int32 TunnelIndex)
+{
+	if (!bShowTestOverlay)
+	{
+		return;
+	}
+
+	const FPortalTunnel& Tunnel = Tunnels[TunnelIndex];
+	const FString TunnelStr = FString::Printf(TEXT("Tunnel %d"), Tunnel.TunnelId);
+
+	if (Tunnel.IsLinked())
+	{
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				90 + TunnelIndex,
+				3.0f,
+				FColor::Green,
+				FString::Printf(TEXT("[%s LINKED!] Portal A <=====> Portal B"), *TunnelStr));
+		}
+	}
+	else
+	{
+		const FString PlacedType = (Tunnel.SlotA.bIsActive) ? TEXT("Portal A") : TEXT("Portal B");
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				90 + TunnelIndex,
+				3.0f,
+				FColor::Yellow,
+				FString::Printf(TEXT("[%s] Placed %s. Waiting for Partner..."), *TunnelStr, *PlacedType));
+		}
+	}
+}
+
+void APortalTargeter::UpdatePortalCaptures(UWorld* World)
+{
+	if (!World || !bShowThroughPortals)
+	{
+		return;
+	}
+
+	auto UpdateOneCapture = [this, World](FPortalSlot& Slot, const FPortalSlot& Partner)
+	{
+		if (!Slot.bIsActive || !IsValid(Slot.SpawnedActor))
+		{
+			return;
+		}
+
+		USceneCaptureComponent2D* Capture = Slot.CaptureComponent;
+		if (!IsValid(Capture))
+		{
+			return;
+		}
+
+		bool bShouldRender = true;
+
+		// No linked partner yet -> nothing to show
+		if (!Partner.bIsActive || !IsValid(Partner.SpawnedActor))
+		{
+			bShouldRender = false;
+		}
+
+		// Recursion guard: never render a portal's own view of itself
+		if (bShouldRender && IsPortalSurfaceVisibleInAnotherCapture(World, Slot))
+		{
+			bShouldRender = false;
+		}
+
+		if (bShouldRender)
+		{
+			// Partner-frame view: the capture sits at the linked partner's portal and looks
+			// outward through it, so the entry portal's surface shows the world beyond the exit.
+			const FVector PartnerLoc = Partner.Location + Partner.Normal * 10.f;
+			const FVector LookDir = Partner.Normal;
+
+			Capture->SetWorldLocation(PartnerLoc);
+			Capture->SetWorldRotation(LookDir.Rotation());
+
+			if (Capture->ProjectionType == ECameraProjectionMode::Perspective)
+			{
+				Capture->FOVAngle = FMath::Clamp(Capture->FOVAngle, 40.f, 120.f);
+			}
+
+			// Clip everything behind the entry portal plane so the view stays inside the aperture
+			Capture->bEnableClipPlane = true;
+			Capture->ClipPlaneBase = Slot.Location - Slot.Normal * 1.0f;
+			Capture->ClipPlaneNormal = Slot.Normal * -1.0f;
+
+			Capture->TextureTarget = Slot.RenderTarget;
+
+			if (IsValid(Slot.RenderTarget))
+			{
+				if (bPortalCaptureEveryFrame)
+				{
+					// bCaptureEveryFrame drives the update; a manual call here would be redundant
+					Capture->SetComponentTickEnabled(true);
+				}
+				else
+				{
+					Capture->CaptureSceneDeferred();
+				}
+			}
+		}
+		else
+		{
+			// No partner or recursing: stop updating so the material keeps whatever it had
+			Capture->SetComponentTickEnabled(false);
+			Capture->TextureTarget = nullptr;
+		}
+	};
+
+	for (FPortalTunnel& Tunnel : Tunnels)
+	{
+		UpdateOneCapture(Tunnel.SlotA, Tunnel.SlotB);
+		UpdateOneCapture(Tunnel.SlotB, Tunnel.SlotA);
+	}
 }
 
 void APortalTargeter::SetPortalViewTexture(AActor* PortalActor, UTextureRenderTarget2D* RenderTarget)
@@ -1006,7 +1125,6 @@ void APortalTargeter::SetPortalViewTexture(AActor* PortalActor, UTextureRenderTa
 			}
 			if (DynMat)
 			{
-				dynMat = DynMat;
 				DynMat->SetTextureParameterValue(FName("PortalView"), RenderTarget);
 			}
 		}
@@ -1058,7 +1176,7 @@ FColor APortalTargeter::GetPortalColor(int32 TunnelId, EPortalType Type)
 
 void APortalTargeter::ConfigurePortalCapture(
 	AActor* PortalActor,
-	const FPortalSlot& Slot,
+	FPortalSlot& Slot,
 	int32 TunnelId,
 	EPortalType Type)
 {
@@ -1066,8 +1184,6 @@ void APortalTargeter::ConfigurePortalCapture(
 	{
 		return;
 	}
-
-	UWorld* World = GetWorld();
 
 	// Find or create the render target + scene capture for this portal surface
 	USceneCaptureComponent2D* Capture = Slot.CaptureComponent;
@@ -1105,32 +1221,10 @@ void APortalTargeter::ConfigurePortalCapture(
 	}
 
 	Capture->TextureTarget = RenderTarget;
-	Capture->CompositeMode = ESceneCaptureCompositeMode::SCM_None;
-	Capture->SetActorRelativeLocation(FVector::ZeroVector);
-	Capture->SetActorRelativeRotation(FRotator::ZeroRotator);
+	Capture->SetRelativeLocation(FVector::ZeroVector);
+	Capture->SetRelativeRotation(FRotator::ZeroRotator);
 
 	// Remember the live objects so UpdatePortalCaptures can drive them
-	Slot.CaptureComponent = Capture;
-	Slot.RenderTarget = RenderTarget;
-
-	// Stash into the global arrays so the render target survives and we can clear stale ones
-	// Remember the live objects so UpdatePortalCaptures can drive them
-	Slot.CaptureComponent = Capture;
-	Slot.RenderTarget = RenderTarget;
-
-	int32 SlotIndex = 0;
-	if (TunnelId == 1)
-	{
-		SlotIndex = 0;
-	}
-	else
-	{
-		SlotIndex = 1;
-	}
-	PortalRenderTargets[SlotIndex] = RenderTarget;
-	PortalCaptureComponents[SlotIndex] = Capture;
-
-	// Stash into the global arrays so the render target survives and we can clear stale ones
 	Slot.CaptureComponent = Capture;
 	Slot.RenderTarget = RenderTarget;
 
